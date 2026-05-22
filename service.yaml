@@ -1,6 +1,6 @@
 name: xmailproxy
 version: "1.0.0"
-entry_class: extensions.xmailproxy.main:MailProxyService
+entry_class: main:MailProxyService
 description: >
   Extension XCore proxy Redis → email pour le marketplace.
   Souscrit au channel Redis "marketplace.email" et dispatche les events
