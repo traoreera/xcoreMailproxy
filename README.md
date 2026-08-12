@@ -1,52 +1,79 @@
-# xmailproxy
+# xmailproxy v2
 
-Extension XCore proxy Redis → email pour le marketplace.
-
-## Pourquoi ce proxy ?
-
-Le worker Celery tourne dans un processus séparé et n'a pas accès aux services XCore (`get_service`). Pour envoyer des emails depuis le pipeline, le worker publie un event JSON sur le channel Redis `marketplace.email`. Cette extension, qui tourne dans le processus API, souscrit à ce channel et dispatche vers `ext.email` (xmailler).
+Proxy email universel XCore — écoute Redis + bus xcore → `ext.email`.
 
 ```
-Worker Celery ──publish──▶ Redis "marketplace.email" ──▶ MailProxyService ──▶ ext.email
+Redis "marketplace.email" ──▶
+Redis "xform.email"        ──▶  MailProxyService  ──▶  ext.email (SMTP)
+Bus xcore "xform.send_email" ──▶
 ```
 
 ## Configuration
 
-Requiert `ext.email` (xmailler) configuré en amont.
-
 ```yaml
-services:
-  extensions:
-    mail_proxy:
-      module: extensions.xmailproxy.main:MailProxyService
-      config:
-        redis_url: ${REDIS_URL}
-        admin_emails:
-          - admin@xcorehub.dev
+extensions:
+  mail_proxy:
+    module: extensions.xcoreMailproxy.main:MailProxyService
+    config:
+      redis_url: ${REDIS_URL}
+      channels:
+        - marketplace.email
+        - xform.email
+      bus_events:
+        - xform.send_email
+      admin_emails:
+        - admin@xcorehub.dev
 ```
 
-### Wiring depuis le plugin marketplace
-
-Dans `on_load()` du plugin marketplace, connecter les deux services :
+## Wiring depuis un plugin
 
 ```python
-proxy = self.get_service("ext.mail_proxy")
-proxy.wire(self.get_service("ext.email"))
+async def on_load(self):
+    proxy = self.get_service("ext.mail_proxy")
+    proxy.wire(self.get_service("ext.email"))
+
+    # Optionnel — utiliser ext.pubsub au lieu de Redis direct
+    proxy.wire_pubsub(self.get_service("ext.pubsub"))
+
+    # Brancher les events du bus xcore (pour les events listés dans bus_events)
+    async def _on_email_event(event):
+        data = getattr(event, "data", event) if not isinstance(event, dict) else event
+        await proxy.handle_bus_event(getattr(event, "name", ""), data)
+
+    for ev in ["xform.send_email"]:
+        self.ctx.events.on(ev, _on_email_event)
 ```
 
-## Actions supportées
+### Priorité des sources
 
-| Action Redis | Destinataire | Description |
-|---|---|---|
-| `submission_received` | Développeur | Accusé de réception de la soumission |
-| `pipeline_approved` | Développeur + Admin | Plugin validé et publié |
-| `pipeline_rejected` | Développeur + Admin | Plugin rejeté avec motif |
-| `pipeline_manual_review` | Développeur + Admin | Revue manuelle requise |
-| `pipeline_failed` | Développeur | Erreur interne du pipeline |
-| `admin_new_submission` | Admin uniquement | Nouvelle soumission arrivée |
+| Source | Activé quand |
+|---|---|
+| `ext.pubsub` (Redis/HiveMQ/Memory) | `wire_pubsub()` appelé avant `init()` |
+| Redis direct | fallback si `wire_pubsub()` non appelé |
+| Bus xcore | toujours, si `bus_events` configuré |
 
-## Format du message Redis
+## Format des messages
 
+### Envoi direct
+```json
+{
+  "to": "alice@example.com",
+  "subject": "Votre candidature",
+  "html": "<p>Merci !</p>"
+}
+```
+
+### Via template
+```json
+{
+  "to": "alice@example.com",
+  "template": "welcome",
+  "context": { "username": "Alice" },
+  "subject": "Bienvenue"
+}
+```
+
+### Actions marketplace (rétrocompatibilité)
 ```json
 {
   "action": "pipeline_approved",
@@ -55,17 +82,23 @@ proxy.wire(self.get_service("ext.email"))
   "plugin_name": "my-plugin",
   "plugin_version": "1.0.0",
   "submission_id": "uuid",
-  "anomaly_score": 12,
-  "rejection_reason": "..."
+  "anomaly_score": 12
 }
 ```
+
+| Action | Dev | Admin |
+|---|---|---|
+| `submission_received` | ✅ | — |
+| `pipeline_approved` | ✅ | ✅ |
+| `pipeline_rejected` | ✅ | ✅ |
+| `pipeline_manual_review` | ✅ | ✅ |
+| `pipeline_failed` | ✅ | — |
+| `admin_new_submission` | — | ✅ |
 
 ## Publier depuis le worker Celery
 
 ```python
-import json
-import redis
-
+import json, redis
 r = redis.from_url(REDIS_URL)
 r.publish("marketplace.email", json.dumps({
     "action": "pipeline_approved",
@@ -78,10 +111,6 @@ r.publish("marketplace.email", json.dumps({
 }))
 ```
 
-## Structure
+## Publier depuis xform (bus xcore)
 
-```
-xmailproxy/
-├── main.py       # MailProxyService (BaseService) — listener Redis + dispatch
-└── service.yaml  # Manifeste de l'extension
-```
+xform émet `xform.send_email` automatiquement sur le bus — aucun code supplémentaire nécessaire côté xform, il suffit que `xform.send_email` soit dans `bus_events`.
